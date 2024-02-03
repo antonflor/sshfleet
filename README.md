@@ -1,74 +1,54 @@
-# NetworkDeviceAutomation.py
+# Network Device Automation Script
 
 ## Overview
 
-NetworkDeviceAutomation.py is a Python 3 script designed for automating network device management tasks. It utilizes SSH and SNMP protocols to interact with a variety of network devices, enabling efficient execution of commands and configuration management. This script is particularly useful for network administrators and IT professionals looking to streamline their network operations.
+This script automates interactions with network devices using SSH and SNMP protocols. It's designed to facilitate network administrators in managing and configuring multiple devices efficiently.
 
 ## Features
 
-- **Device Type Autodetection**: Automatically identifies the type of network device using SSH and SNMP.
-- **Command Execution**: Executes a predefined list of commands on multiple devices.
-- **Configuration Management**: Facilitates efficient management of device configurations.
-- **Logging and Error Handling**: Maintains logs for operations and errors for better insight and troubleshooting.
-- **User Interaction**: Securely prompts for user credentials and command inputs.
+- **Device Type Autodetection**: Determines the type of network devices using SSH and SNMP.
+- **Command Execution**: Executes a list of commands on specified devices.
+- **Configuration Management**: Manages device configurations.
+- **Logging**: Maintains logs for operations and errors.
+- **User Interaction**: Prompts for user credentials and command inputs securely.
 - **Ping Check**: Verifies network reachability of devices before processing.
-- **Robust Error Handling**: Includes retry mechanisms for enhanced reliability.
+- **Error Handling**: Implements robust error handling and retry mechanisms.
 
 ## Prerequisites
 
 - Python 3.x
-- `netmiko` library
-- Access to network devices compatible with SSH and SNMP protocols.
+- Netmiko library
 
 ## Installation
 
-1. Clone the repository:
+1. Ensure Python 3.x is installed on your system.
+
+2. Install Netmiko using pip:
 
    ```
-   git clone https://github.com/antonflor/NetworkDeviceAutomation.git
-   ```
-
-2. Navigate to the script directory:
-
-   ```
-   cd NetworkDeviceAutomation
-   ```
-
-3. Install required Python libraries:
-
-   ```
-   pip install -r requirements.txt
+   pip install netmiko
    ```
 
 ## Usage
 
-1. Prepare a list of devices and commands in separate text files.
+1. Modify the script to include the necessary device IPs, commands, and credentials.
 
 2. Run the script:
 
    ```
-   python3 NetworkDeviceAutomation.py
+   python NetworkDeviceAutomation.py
    ```
 
-3. Follow the on-screen prompts to enter user credentials and file names for devices and commands.
+3. Follow the on-screen prompts for user credentials and other inputs.
 
-## Configuration
+## Logs
 
-- Modify the script as needed to accommodate specific network environments or device types.
-- Update the command list file to include the commands you wish to execute on the network devices.
+Logs are generated in the current working directory, named `any_automate.log`, followed by a timestamp.
 
 ## Contributing
 
-Contributions to this project are welcome. Please fork the repository and submit a pull request with your changes.
+Contributions to this project are welcome. Please ensure to update tests as appropriate.
 
 ## License
 
-This project is licensed under the MIT License.
-
-## Support
-
-For support or queries, please open an issue in the GitHub repository issue tracker.
-
-------
-
-*Note: This script is intended for professional use. Please ensure you have proper authorization to access and manage the network devices targeted by this script.*
+This project is licensed under the MIT License - see the [LICENSE.md](https://chat.openai.com/c/LICENSE.md) file for details.
