@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Local artifacts produced by NetworkDeviceAutomation.py
+any_automate.log.*
+*.log
