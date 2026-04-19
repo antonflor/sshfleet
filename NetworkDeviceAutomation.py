@@ -1,161 +1,462 @@
 #!/usr/bin/env python3
+"""Bulk-execute commands across a list of network devices via SSH (netmiko).
 
-'''
-Script for automated network device interactions
-Version: 3.0
-Updated: 2020-07-14
-'''
+Reads a devices file (one host per line, optionally `name ip`) and a commands
+file (one command per line), pings each device, optionally autodetects its
+type via SNMP/SSH, runs the commands, and writes a JSON session report plus
+per-device log files.
+"""
 
-import os
+from __future__ import annotations
+
+import argparse
 import json
+import logging
+import os
+import platform
+import shutil
 import subprocess
-import base64
+import sys
+import time
+import warnings
+from contextlib import contextmanager
+from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from getpass import getpass
+from pathlib import Path
+from typing import Iterable, Iterator, List, Optional, Sequence
+
 from netmiko import ConnectHandler, SSHDetect, SNMPDetect
-import warnings
-warnings.filterwarnings(action='ignore', module='.*paramiko.*')
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
-# Handle signals
-import signal
-signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # IOError: Broken pipe
-signal.signal(signal.SIGINT, signal.SIG_DFL)   # KeyboardInterrupt: Ctrl-C
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r".*paramiko.*")
 
-# Global variables
-CUR_DIR = os.getcwd()
-LOGFILE = os.path.join(CUR_DIR, f'any_automate.log.{datetime.now().strftime("%Y%m%d_%H%M%S")}')
+# SIGPIPE is POSIX-only; SIGINT exists everywhere but the default handler is
+# already what we want, so we only adjust what's actually needed per-platform.
+if hasattr(__import__("signal"), "SIGPIPE"):
+    import signal
 
-# Function definitions
-def get_time():
-    return datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
-def add_log(ip, log_type, message):
-    with open(f'{ip}.log', 'a') as f:
-        log = f'{get_time()} - {ip} {log_type} {message}\n'
-        f.write(log)
 
-def ping_check(ip):
-    response = subprocess.call(['ping', '-c', '3', str(ip)])
-    return 'reachable' if response == 0 else 'unreachable'
+SESSION_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+DEFAULT_SESSION_LOG = Path.cwd() / f"any_automate.log.{SESSION_TIMESTAMP}"
 
-def get_info(info):
-    return base64.b64decode(info).decode('utf-8') if info else None
+SEP_MAJOR = "=" * 50
+SEP_MINOR = "=" * 5
 
-def return_type(ip, usr, pwd, commu=None):
-    commu = commu or get_info('c25tcG0zIQ==\n')
-    ssh_info = {'device_type': 'autodetect', 'host': ip, 'username': usr, 'password': pwd}
-    snmp_info = {'hostname': ip, 'community': commu, 'snmp_version': 'v2c'}
+logger = logging.getLogger("network_automation")
 
-    for _ in range(3):  # up to 3 attempts
-        try:
-            guesser_snmp = SNMPDetect(**snmp_info)
-            guess = guesser_snmp.autodetect()
-            return guess
-        except Exception as e_snmp:
-            pass
 
-        try:
-            guesser_ssh = SSHDetect(**ssh_info)
-            guess = guesser_ssh.autodetect()
-            return guess
-        except Exception as e_ssh:
-            if _ == 2:  # last attempt
-                add_log(ip, 'ERROR', f'SNMP Error: {e_snmp}, SSH Error: {e_ssh}')
-                return None
+# --------------------------------------------------------------------------- #
+# Data model
+# --------------------------------------------------------------------------- #
 
-def gather_device_info():
-    usr = input('User: ')
-    pwd = getpass('Password: ')
-    dev_file = input('Devices File: ')
-    cmds_file = input('Commands File: ')
 
-    with open(dev_file, 'r') as df, open(cmds_file, 'r') as cf:
-        devices = df.readlines()
-        commands = cf.readlines()
+@dataclass
+class DeviceJob:
+    host: str
+    username: str
+    password: str = field(repr=False)
+    commands: List[str] = field(default_factory=list)
+    reachable: bool = False
+    device_type: Optional[str] = None
+    error: Optional[str] = None
 
-    ret = {'stuff': [], 'in': len(devices), 'cmds': [cmd.strip() for cmd in commands if cmd]}
-    for line in devices:
-        host = line.strip().split()
-        hn = host[1] if len(host) > 1 else host[0]
-        pingresult = ping_check(hn)
-        type_ = return_type(hn, usr, pwd) if pingresult == 'reachable' else None
-        err = 'Unable to determine device type' if not type_ else None
-        ret['stuff'].append({'device': hn, 'cmds': ret['cmds'], 'usr': usr, 'pwd': pwd, 'ping': pingresult, 'type': type_, 'error': err})
 
-    return ret
+@dataclass
+class DeviceResult:
+    device: str
+    complete: bool
+    error: str = ""
 
-def check_go(go):
-    return go.lower() in ['y', 'yes']
+    def to_dict(self) -> dict:
+        return asdict(self)
 
-def get_clean_commands(commands, type_):
-    return ['do ' + c if type_ and 'cisco_ios' in type_ and c.startswith('show') else c for c in commands]
 
-def get_clean_output(output):
-    return ' '.join('\n   {}'.format(out) for out in output.split('\n'))
+# --------------------------------------------------------------------------- #
+# Logging
+# --------------------------------------------------------------------------- #
 
-def do_things(**kwargs):
-    dev = kwargs.get('device')
-    cmds = kwargs.get('cmds')
-    usr = kwargs.get('usr')
-    pwd = kwargs.get('pwd')
-    err = kwargs.get('error', '')
-    device_type = kwargs.get('type')
 
-    new_cmds = get_clean_commands(cmds, device_type)
-    cmd_print = ' '.join('\n - {}'.format(command) for command in new_cmds)
-    sep_one = '=' * 50
-    sep_two = '=' * 5
+def _device_logger(host: str) -> logging.Logger:
+    """Per-device logger that appends to ``<host>.log`` in the cwd."""
+    name = f"network_automation.device.{host}"
+    log = logging.getLogger(name)
+    if not log.handlers:
+        handler = logging.FileHandler(f"{host}.log")
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        )
+        log.addHandler(handler)
+        log.setLevel(logging.INFO)
+        log.propagate = False
+    return log
 
-    print(f'{get_time()} - {dev} - Processing..')
-    add_session_log(dev, f'{get_time()} - Processing Device: {dev}')
+
+def configure_root_logging(verbose: bool) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Reachability
+# --------------------------------------------------------------------------- #
+
+
+def ping_check(host: str, count: int = 3, timeout: int = 2) -> bool:
+    """Return True if ``host`` responds to ICMP, False otherwise.
+
+    Cross-platform: uses ``-n`` on Windows and ``-c`` elsewhere.
+    """
+    if shutil.which("ping") is None:
+        logger.warning("ping binary not found; assuming %s reachable", host)
+        return True
+
+    if platform.system().lower().startswith("win"):
+        cmd = ["ping", "-n", str(count), "-w", str(timeout * 1000), host]
+    else:
+        cmd = ["ping", "-c", str(count), "-W", str(timeout), host]
 
     try:
-        if err:
-            raise RuntimeError(err)
-        connecthandler = get_connecthandler(dev, usr, pwd, device_type)
-        run_cmds = connecthandler.send_config_set(new_cmds)
-        clean_out = get_clean_output(run_cmds)
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=count * timeout + 5,
+        )
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
 
-        print(sep_two)
-        print_stuff = f'Device:\n - {dev}\n{sep_two}\nCommands: {cmd_print}\n{sep_two}\nOutput: {clean_out}'
-        print(print_stuff)
-        add_session_log(dev, f'\n{sep_one}\n{get_time()} - Device Results:\n{sep_two}\n{print_stuff}')
-        print(f'{sep_two}\n{dev} - Done\n{sep_one}')
 
-        return {'complete': True, 'device': dev, 'error': ''}
-    except Exception as e:
-        error_message = f'\n{dev} - Broke..ERROR: {e}\n{sep_one}'
-        print(error_message)
-        add_session_log(dev, error_message)
-        return {'complete': False, 'device': dev, 'error': str(e)}
+# --------------------------------------------------------------------------- #
+# Device type detection
+# --------------------------------------------------------------------------- #
 
-def do_stuff():
-    start_time = datetime.now()
-    stuffs = gather_device_info()
-    total_devices = stuffs.get('in', 0)
-    cmds = stuffs.get('cmds', [])
-    cmd_list = ' '.join('\n        - {}'.format(c) for c in cmds)
-    sep = '=' * 50
 
-    print(f'\n{sep}\nTotal devices: {total_devices}\nCommand(s): {cmd_list}\n{sep}\n')
-    proceed = check_go(input('Proceed? [y/n]: '))
-    if not proceed:
-        print('Exiting.. ')
-        sys.exit()
+def detect_device_type(
+    host: str,
+    username: str,
+    password: str,
+    snmp_community: Optional[str] = None,
+    attempts: int = 3,
+    backoff: float = 1.0,
+) -> Optional[str]:
+    """Try SNMP first (if community given), then SSH autodetect."""
+    last_error: Optional[str] = None
 
-    print('=' * 75)
-    results = [do_things(**device_info) for device_info in stuffs.get('stuff', [])]
+    for attempt in range(1, attempts + 1):
+        if snmp_community:
+            try:
+                guess = SNMPDetect(
+                    hostname=host,
+                    community=snmp_community,
+                    snmp_version="v2c",
+                ).autodetect()
+                if guess:
+                    return guess
+            except Exception as exc:  # noqa: BLE001 - netmiko raises broad types
+                last_error = f"SNMP: {exc}"
 
-    good = [g for g in results if g.get('complete')]
-    bad = [b for b in results if not b.get('complete')]
-    end_time = datetime.now()
+        try:
+            guess = SSHDetect(
+                device_type="autodetect",
+                host=host,
+                username=username,
+                password=password,
+            ).autodetect()
+            if guess:
+                return guess
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"SSH: {exc}"
 
-    print(f'Start Time: {start_time}\nEnd Time: {end_time}\nTotal Time: {end_time - start_time}')
-    print('=' * 25)
-    print(f'Total in: {total_devices}\nTotal Processed: {len(results)}\nTotal Completed: {len(good)}\nTotal Failed: {len(bad)}\nErrors: {json.dumps(bad, indent=4)}')
+        if attempt < attempts:
+            time.sleep(backoff * attempt)
 
-    with open(LOGFILE, 'w') as lf:
-        lf.write(json.dumps(results))
+    if last_error:
+        _device_logger(host).error("Device-type detection failed: %s", last_error)
+    return None
 
-if __name__ == '__main__':
-    do_stuff()
+
+# --------------------------------------------------------------------------- #
+# File parsing
+# --------------------------------------------------------------------------- #
+
+
+def parse_devices_file(path: Path) -> List[str]:
+    """One host per line. Lines may be ``hostname ip`` (ip wins) or ``ip``.
+
+    Blank lines and ``#`` comments are skipped.
+    """
+    hosts: List[str] = []
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        hosts.append(parts[1] if len(parts) > 1 else parts[0])
+    return hosts
+
+
+def parse_commands_file(path: Path) -> List[str]:
+    return [
+        line.strip()
+        for line in path.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Command execution
+# --------------------------------------------------------------------------- #
+
+
+@contextmanager
+def open_connection(
+    host: str, username: str, password: str, device_type: str
+) -> Iterator["ConnectHandler"]:
+    conn = ConnectHandler(
+        device_type=device_type,
+        host=host,
+        username=username,
+        password=password,
+    )
+    try:
+        yield conn
+    finally:
+        try:
+            conn.disconnect()
+        except Exception:  # noqa: BLE001 - cleanup must not raise
+            pass
+
+
+def _is_show_command(cmd: str) -> bool:
+    head = cmd.strip().split(" ", 1)[0].lower()
+    return head in {"show", "display", "get"}
+
+
+def run_commands(
+    conn: "ConnectHandler",
+    commands: Sequence[str],
+    config_mode: bool,
+) -> str:
+    """Run commands either in exec (default) or config mode.
+
+    In default mode, show-style commands use ``send_command`` and anything
+    else is rejected unless ``config_mode`` is set, removing the original
+    ``'do ' + c`` Cisco-only hack.
+    """
+    if config_mode:
+        return conn.send_config_set(list(commands))
+
+    chunks: List[str] = []
+    for cmd in commands:
+        if not _is_show_command(cmd):
+            raise ValueError(
+                f"Refusing to run non-show command {cmd!r} without --config"
+            )
+        chunks.append(f"--- {cmd} ---\n{conn.send_command(cmd)}")
+    return "\n".join(chunks)
+
+
+def _format_block(title: str, body: str) -> str:
+    indented = "\n   ".join(body.splitlines()) if body else ""
+    return f"{title}:\n   {indented}" if indented else f"{title}:"
+
+
+def execute_job(job: DeviceJob, config_mode: bool) -> DeviceResult:
+    dev_log = _device_logger(job.host)
+    logger.info("%s - processing", job.host)
+    dev_log.info("Processing device")
+
+    if job.error:
+        logger.error("%s - %s", job.host, job.error)
+        dev_log.error(job.error)
+        return DeviceResult(device=job.host, complete=False, error=job.error)
+
+    if not job.device_type:
+        msg = "Unable to determine device type"
+        dev_log.error(msg)
+        return DeviceResult(device=job.host, complete=False, error=msg)
+
+    try:
+        with open_connection(
+            job.host, job.username, job.password, job.device_type
+        ) as conn:
+            output = run_commands(conn, job.commands, config_mode=config_mode)
+    except (NetmikoAuthenticationException, NetmikoTimeoutException) as exc:
+        dev_log.error("Connection failed: %s", exc)
+        return DeviceResult(device=job.host, complete=False, error=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        dev_log.error("Execution failed: %s", exc)
+        return DeviceResult(device=job.host, complete=False, error=str(exc))
+
+    cmd_print = "\n - ".join([""] + list(job.commands))
+    summary = (
+        f"Device:\n - {job.host}\n{SEP_MINOR}\n"
+        f"Commands:{cmd_print}\n{SEP_MINOR}\n"
+        f"{_format_block('Output', output)}"
+    )
+    print(SEP_MINOR)
+    print(summary)
+    print(f"{SEP_MINOR}\n{job.host} - Done\n{SEP_MAJOR}")
+    dev_log.info("Results:\n%s", summary)
+
+    return DeviceResult(device=job.host, complete=True)
+
+
+# --------------------------------------------------------------------------- #
+# Orchestration
+# --------------------------------------------------------------------------- #
+
+
+def build_jobs(
+    hosts: Iterable[str],
+    commands: Sequence[str],
+    username: str,
+    password: str,
+    snmp_community: Optional[str],
+) -> List[DeviceJob]:
+    jobs: List[DeviceJob] = []
+    for host in hosts:
+        reachable = ping_check(host)
+        if not reachable:
+            jobs.append(
+                DeviceJob(
+                    host=host,
+                    username=username,
+                    password=password,
+                    commands=list(commands),
+                    reachable=False,
+                    error="Host unreachable",
+                )
+            )
+            continue
+
+        device_type = detect_device_type(host, username, password, snmp_community)
+        jobs.append(
+            DeviceJob(
+                host=host,
+                username=username,
+                password=password,
+                commands=list(commands),
+                reachable=True,
+                device_type=device_type,
+                error=None if device_type else "Unable to determine device type",
+            )
+        )
+    return jobs
+
+
+def confirm(prompt: str) -> bool:
+    answer = input(prompt).strip().lower()
+    return answer in {"y", "yes"}
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run a list of commands across a list of network devices."
+    )
+    parser.add_argument("--user", help="SSH username (prompted if omitted)")
+    parser.add_argument(
+        "--devices-file", type=Path, help="Path to devices list (prompted if omitted)"
+    )
+    parser.add_argument(
+        "--commands-file", type=Path, help="Path to commands list (prompted if omitted)"
+    )
+    parser.add_argument(
+        "--snmp-community",
+        default=os.environ.get("SNMP_COMMUNITY"),
+        help="SNMP v2c community for device-type detection "
+        "(or set SNMP_COMMUNITY env var)",
+    )
+    parser.add_argument(
+        "--config",
+        action="store_true",
+        help="Run commands in config mode (otherwise only show-style commands allowed)",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the interactive 'Proceed?' confirmation prompt",
+    )
+    parser.add_argument(
+        "--session-log",
+        type=Path,
+        default=DEFAULT_SESSION_LOG,
+        help="Where to write the JSON session summary",
+    )
+    parser.add_argument("--verbose", "-v", action="store_true")
+    return parser.parse_args(argv)
+
+
+def _prompt_path(label: str, value: Optional[Path]) -> Path:
+    if value is not None:
+        path = value
+    else:
+        path = Path(input(f"{label}: ").strip())
+    if not path.is_file():
+        raise FileNotFoundError(f"{label} not found: {path}")
+    return path
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(argv)
+    configure_root_logging(args.verbose)
+
+    username = args.user or input("User: ")
+    password = getpass("Password: ")
+
+    devices_path = _prompt_path("Devices File", args.devices_file)
+    commands_path = _prompt_path("Commands File", args.commands_file)
+
+    hosts = parse_devices_file(devices_path)
+    commands = parse_commands_file(commands_path)
+
+    if not hosts:
+        logger.error("No devices to process")
+        return 1
+    if not commands:
+        logger.error("No commands to run")
+        return 1
+
+    cmd_list = "\n        - ".join([""] + commands)
+    print(
+        f"\n{SEP_MAJOR}\nTotal devices: {len(hosts)}"
+        f"\nCommand(s):{cmd_list}\n{SEP_MAJOR}\n"
+    )
+    if not args.yes and not confirm("Proceed? [y/n]: "):
+        print("Exiting.. ")
+        return 0
+
+    print("=" * 75)
+    start = datetime.now()
+
+    jobs = build_jobs(hosts, commands, username, password, args.snmp_community)
+    results = [execute_job(job, config_mode=args.config) for job in jobs]
+
+    end = datetime.now()
+    completed = [r for r in results if r.complete]
+    failed = [r for r in results if not r.complete]
+
+    print(f"Start Time: {start}\nEnd Time: {end}\nTotal Time: {end - start}")
+    print("=" * 25)
+    print(
+        f"Total in: {len(hosts)}\nTotal Processed: {len(results)}"
+        f"\nTotal Completed: {len(completed)}\nTotal Failed: {len(failed)}"
+        f"\nErrors: {json.dumps([r.to_dict() for r in failed], indent=4)}"
+    )
+
+    args.session_log.write_text(
+        json.dumps([r.to_dict() for r in results], indent=2)
+    )
+    return 0 if not failed else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

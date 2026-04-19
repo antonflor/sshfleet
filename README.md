@@ -16,39 +16,61 @@ This script automates interactions with network devices using SSH and SNMP proto
 
 ## Prerequisites
 
-- Python 3.x
-- Netmiko library
+- Python 3.8+
+- [Netmiko](https://github.com/ktbyers/netmiko) 4.x
 
 ## Installation
 
-1. Ensure Python 3.x is installed on your system.
-
-2. Install Netmiko using pip:
-
-   ```
-   pip install netmiko
-   ```
+```
+pip install -r requirements.txt
+```
 
 ## Usage
 
-1. Modify the script to include the necessary device IPs, commands, and credentials.
+Fully interactive (legacy behaviour):
 
-2. Run the script:
+```
+python NetworkDeviceAutomation.py
+```
 
-   ```
-   python NetworkDeviceAutomation.py
-   ```
+Or with flags (any flag you omit is prompted for):
 
-3. Follow the on-screen prompts for user credentials and other inputs.
+```
+python NetworkDeviceAutomation.py \
+    --user admin \
+    --devices-file devices.txt \
+    --commands-file commands.txt \
+    --snmp-community public \
+    --yes
+```
+
+By default only `show` / `display` / `get` style commands are accepted. To
+push configuration changes, pass `--config` (commands are then run via
+netmiko's `send_config_set`).
+
+### File formats
+
+- **devices file**: one host per line. `name ip` is allowed (the IP wins).
+  Blank lines and `#`-comments are skipped.
+- **commands file**: one command per line. Blank lines and `#`-comments
+  are skipped.
 
 ## Logs
 
-Logs are generated in the current working directory, named `any_automate.log`, followed by a timestamp.
+- Per-device logs: `<host>.log` in the working directory.
+- Per-session JSON summary: `any_automate.log.<timestamp>` (override with
+  `--session-log`).
+
+## Exit codes
+
+- `0` — all devices succeeded (or user cancelled at the prompt).
+- `1` — bad input (no devices/commands or missing files).
+- `2` — at least one device failed.
 
 ## Contributing
 
-Contributions to this project are welcome. Please ensure to update tests as appropriate.
+Contributions are welcome. Please add tests for non-trivial logic.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE.md](https://chat.openai.com/c/LICENSE.md) file for details.
+MIT — see `LICENSE` if present.
