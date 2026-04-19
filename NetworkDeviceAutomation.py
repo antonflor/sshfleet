@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -358,6 +359,33 @@ def confirm(prompt: str) -> bool:
     return answer in {"y", "yes"}
 
 
+def run_jobs(
+    jobs: Sequence[DeviceJob],
+    config_mode: bool,
+    concurrency: int,
+) -> List[DeviceResult]:
+    """Execute ``jobs``. ``concurrency=1`` preserves sequential behaviour.
+
+    When running concurrently, results are returned in the same order as
+    ``jobs`` so the session summary stays deterministic.
+    """
+    if concurrency < 1:
+        raise ValueError("concurrency must be >= 1")
+    if concurrency == 1 or len(jobs) <= 1:
+        return [execute_job(job, config_mode=config_mode) for job in jobs]
+
+    results: List[Optional[DeviceResult]] = [None] * len(jobs)
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = {
+            pool.submit(execute_job, job, config_mode): idx
+            for idx, job in enumerate(jobs)
+        }
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            results[idx] = fut.result()
+    return [r for r in results if r is not None]
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a list of commands across a list of network devices."
@@ -391,8 +419,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=DEFAULT_SESSION_LOG,
         help="Where to write the JSON session summary",
     )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Number of devices to process in parallel (default: 1)",
+    )
     parser.add_argument("--verbose", "-v", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.concurrency < 1:
+        parser.error("--concurrency must be >= 1")
+    return args
 
 
 def _prompt_path(label: str, value: Optional[Path]) -> Path:
@@ -438,7 +475,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     start = datetime.now()
 
     jobs = build_jobs(hosts, commands, username, password, args.snmp_community)
-    results = [execute_job(job, config_mode=args.config) for job in jobs]
+    results = run_jobs(jobs, config_mode=args.config, concurrency=args.concurrency)
 
     end = datetime.now()
     completed = [r for r in results if r.complete]

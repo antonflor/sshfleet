@@ -48,6 +48,11 @@ By default only `show` / `display` / `get` style commands are accepted. To
 push configuration changes, pass `--config` (commands are then run via
 netmiko's `send_config_set`).
 
+Use `--concurrency N` to process N devices in parallel (default `1`, which
+preserves the original sequential behaviour). Results are still reported in
+input order. SSH and SNMP are I/O-bound so a `ThreadPoolExecutor` works
+well; 8–16 is a reasonable starting point for large inventories.
+
 ### File formats
 
 - **devices file**: one host per line. `name ip` is allowed (the IP wins).
