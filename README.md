@@ -1,76 +1,167 @@
-# Network Device Automation Script
+# Network Device Automation
 
-## Overview
+Bulk-execute commands across a list of network devices over SSH, with optional
+SNMP-based device-type autodetection. Thin wrapper over
+[Netmiko](https://github.com/ktbyers/netmiko) with sensible defaults, per-device
+logs, a JSON session summary, and opt-in parallelism.
 
-This script automates interactions with network devices using SSH and SNMP protocols. It's designed to facilitate network administrators in managing and configuring multiple devices efficiently.
+## Quick start
 
-## Features
-
-- **Device Type Autodetection**: Determines the type of network devices using SSH and SNMP.
-- **Command Execution**: Executes a list of commands on specified devices.
-- **Configuration Management**: Manages device configurations.
-- **Logging**: Maintains logs for operations and errors.
-- **User Interaction**: Prompts for user credentials and command inputs securely.
-- **Ping Check**: Verifies network reachability of devices before processing.
-- **Error Handling**: Implements robust error handling and retry mechanisms.
-
-## Prerequisites
-
-- Python 3.8+
-- [Netmiko](https://github.com/ktbyers/netmiko) 4.x
-
-## Installation
-
-```
+```bash
+git clone https://github.com/antonflor/NetworkDeviceAutomation.git
+cd NetworkDeviceAutomation
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Usage
+Create an inventory file and a command file:
 
-Fully interactive (legacy behaviour):
-
+```text
+# devices.txt — one host per line; "name ip" also OK (IP wins); # for comments
+core-sw1 10.0.0.1
+10.0.0.2
 ```
-python NetworkDeviceAutomation.py
+
+```text
+# commands.txt — one command per line
+show version
+show ip interface brief
 ```
 
-Or with flags (any flag you omit is prompted for):
+Run it:
 
-```
+```bash
 python NetworkDeviceAutomation.py \
     --user admin \
     --devices-file devices.txt \
     --commands-file commands.txt \
-    --snmp-community public \
+    --concurrency 8 \
     --yes
 ```
 
-By default only `show` / `display` / `get` style commands are accepted. To
-push configuration changes, pass `--config` (commands are then run via
-netmiko's `send_config_set`).
+## Requirements
 
-### File formats
+- Python 3.9+
+- [Netmiko](https://github.com/ktbyers/netmiko) 4.x (installed by `requirements.txt`)
+- `ping` on `PATH` (optional — reachability checks are skipped if it's missing)
 
-- **devices file**: one host per line. `name ip` is allowed (the IP wins).
+## Usage
+
+### Fully interactive (legacy behaviour)
+
+```bash
+python NetworkDeviceAutomation.py
+```
+
+Prompts for user, password, devices file, and commands file. Any flag you
+pass on the command line replaces the corresponding prompt.
+
+### Read-only commands (default)
+
+Only `show` / `display` / `get` style commands are accepted. Anything else
+is rejected up front — you can't change config by accident.
+
+```bash
+python NetworkDeviceAutomation.py \
+    --user admin \
+    --devices-file devices.txt \
+    --commands-file commands.txt \
+    --yes
+```
+
+### Pushing configuration changes
+
+Pass `--config` to run the command list via netmiko's `send_config_set`:
+
+```bash
+python NetworkDeviceAutomation.py \
+    --user admin \
+    --devices-file devices.txt \
+    --commands-file changes.txt \
+    --config
+```
+
+### Parallel execution
+
+`--concurrency N` runs N devices in parallel via a `ThreadPoolExecutor`.
+Default is `1` (sequential). SSH/SNMP are I/O-bound, so 8–16 is a sensible
+starting point for large inventories. Results stay in input order in the
+session summary.
+
+```bash
+python NetworkDeviceAutomation.py --concurrency 16 ...
+```
+
+### SNMP-based device-type autodetect
+
+If you supply an SNMP community, detection tries SNMP first (faster than
+SSH autodetect) before falling back to SSH. Never hardcode the community
+in source — pass it explicitly:
+
+```bash
+python NetworkDeviceAutomation.py --snmp-community public ...
+# or
+SNMP_COMMUNITY=public python NetworkDeviceAutomation.py ...
+```
+
+### All flags
+
+```
+--user USER              SSH username (prompted if omitted)
+--devices-file PATH      Inventory file (prompted if omitted)
+--commands-file PATH     Command list (prompted if omitted)
+--snmp-community STR     Enables SNMP detection (or set SNMP_COMMUNITY env var)
+--config                 Run commands in config mode via send_config_set
+--concurrency N          Parallel devices (default 1)
+--yes                    Skip the "Proceed? [y/n]" confirmation prompt
+--session-log PATH       Override the JSON summary location
+--verbose, -v            Debug logging
+```
+
+## File formats
+
+- **devices file** — one host per line. `name ip` is allowed (the IP wins).
   Blank lines and `#`-comments are skipped.
-- **commands file**: one command per line. Blank lines and `#`-comments
+- **commands file** — one command per line. Blank lines and `#`-comments
   are skipped.
 
-## Logs
+## Output
 
-- Per-device logs: `<host>.log` in the working directory.
-- Per-session JSON summary: `any_automate.log.<timestamp>` (override with
-  `--session-log`).
+Written to the current working directory:
+
+- `<host>.log` — per-device log: connection events, commands run, raw output.
+- `any_automate.log.<timestamp>` — JSON array summarising every device's
+  result (`device`, `complete`, `error`). Override the path with
+  `--session-log`.
 
 ## Exit codes
 
-- `0` — all devices succeeded (or user cancelled at the prompt).
-- `1` — bad input (no devices/commands or missing files).
-- `2` — at least one device failed.
+| Code | Meaning |
+|---|---|
+| `0` | All devices succeeded (or the user cancelled at the prompt). |
+| `1` | Bad input: missing files, empty devices/commands list. |
+| `2` | At least one device failed. |
+
+These slot cleanly into cron or CI.
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q           # unit tests (netmiko is stubbed — no real deps needed)
+ruff check .        # lint
+python -m py_compile NetworkDeviceAutomation.py
+```
+
+CI runs the same three checks across Python 3.9–3.12 on every push and PR
+(see `.github/workflows/ci.yml`).
 
 ## Contributing
 
-Contributions are welcome. Please add tests for non-trivial logic.
+PRs welcome. Please keep changes small, add tests for non-trivial logic,
+and make sure `pytest -q` and `ruff check .` are green locally before
+opening a PR.
 
 ## License
 
-MIT — see `LICENSE` if present.
+[MIT](LICENSE).
