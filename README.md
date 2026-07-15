@@ -5,8 +5,6 @@ optional SNMP-based device-type autodetection. Thin wrapper over
 [Netmiko](https://github.com/ktbyers/netmiko) with sensible defaults,
 per-device logs, a JSON session summary, and opt-in parallelism.
 
-*(Formerly published as NetworkDeviceAutomation.)*
-
 ## Install
 
 The cleanest way is [pipx](https://pipx.pypa.io/), which gives you an isolated
