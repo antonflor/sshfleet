@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sshfleet"
+dynamic = ["version"]
+description = "Bulk-execute commands across a fleet of network devices over SSH (netmiko), with reachability checks, device-type autodetection, and parallel execution."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Anton Flor" }]
+keywords = ["netmiko", "network", "automation", "ssh", "cisco", "cli"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Networking",
+]
+dependencies = ["netmiko>=4.3"]
+
+[project.optional-dependencies]
+snmp = ["pysnmp"]
+dev = ["pytest>=7", "ruff>=0.4"]
+
+[project.urls]
+Homepage = "https://github.com/antonflor/sshfleet"
+Issues = "https://github.com/antonflor/sshfleet/issues"
+
+[project.scripts]
+sshfleet = "sshfleet:main"
+
+[tool.setuptools]
+py-modules = ["sshfleet"]
+
+[tool.setuptools.dynamic]
+version = { attr = "sshfleet.__version__" }
+
+[tool.ruff]
+target-version = "py39"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

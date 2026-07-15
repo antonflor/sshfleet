@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bulk-execute commands across a list of network devices via SSH (netmiko).
+"""sshfleet — bulk-execute commands across a fleet of network devices via SSH (netmiko).
 
 Reads a devices file (one host per line, optionally `name ip`) and a commands
 file (one command per line), pings each device, optionally autodetects its
@@ -22,13 +22,16 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict
+from functools import lru_cache
 from datetime import datetime
 from getpass import getpass
 from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Sequence
 
-from netmiko import ConnectHandler, SSHDetect, SNMPDetect
+from netmiko import ConnectHandler, SSHDetect
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+
+__version__ = "2.0.0"
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module=r".*paramiko.*")
 
@@ -41,12 +44,11 @@ if hasattr(__import__("signal"), "SIGPIPE"):
 
 
 SESSION_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
-DEFAULT_SESSION_LOG = Path.cwd() / f"any_automate.log.{SESSION_TIMESTAMP}"
 
 SEP_MAJOR = "=" * 50
 SEP_MINOR = "=" * 5
 
-logger = logging.getLogger("network_automation")
+logger = logging.getLogger("sshfleet")
 
 
 # --------------------------------------------------------------------------- #
@@ -63,6 +65,7 @@ class DeviceJob:
     reachable: bool = False
     device_type: Optional[str] = None
     error: Optional[str] = None
+    log_dir: Path = field(default_factory=Path.cwd)
 
 
 @dataclass
@@ -80,12 +83,12 @@ class DeviceResult:
 # --------------------------------------------------------------------------- #
 
 
-def _device_logger(host: str) -> logging.Logger:
-    """Per-device logger that appends to ``<host>.log`` in the cwd."""
-    name = f"network_automation.device.{host}"
+def _device_logger(host: str, log_dir: Optional[Path] = None) -> logging.Logger:
+    """Per-device logger that appends to ``<host>.log`` in ``log_dir`` (cwd default)."""
+    name = f"sshfleet.device.{host}"
     log = logging.getLogger(name)
     if not log.handlers:
-        handler = logging.FileHandler(f"{host}.log")
+        handler = logging.FileHandler((log_dir or Path.cwd()) / f"{host}.log")
         handler.setFormatter(
             logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         )
@@ -140,6 +143,21 @@ def ping_check(host: str, count: int = 3, timeout: int = 2) -> bool:
 # --------------------------------------------------------------------------- #
 
 
+@lru_cache(maxsize=None)
+def _snmp_detect_cls():
+    """SNMPDetect is optional: it moved out of netmiko's top level and needs pysnmp."""
+    try:
+        from netmiko.snmp_autodetect import SNMPDetect
+
+        return SNMPDetect
+    except ImportError:
+        logger.warning(
+            "SNMP detection unavailable (install the 'pysnmp' extra: "
+            "pip install sshfleet[snmp]); falling back to SSH autodetect"
+        )
+        return None
+
+
 def detect_device_type(
     host: str,
     username: str,
@@ -152,9 +170,10 @@ def detect_device_type(
     last_error: Optional[str] = None
 
     for attempt in range(1, attempts + 1):
-        if snmp_community:
+        snmp_detect = _snmp_detect_cls() if snmp_community else None
+        if snmp_detect is not None:
             try:
-                guess = SNMPDetect(
+                guess = snmp_detect(
                     hostname=host,
                     community=snmp_community,
                     snmp_version="v2c",
@@ -271,7 +290,7 @@ def _format_block(title: str, body: str) -> str:
 
 
 def execute_job(job: DeviceJob, config_mode: bool) -> DeviceResult:
-    dev_log = _device_logger(job.host)
+    dev_log = _device_logger(job.host, job.log_dir)
     logger.info("%s - processing", job.host)
     dev_log.info("Processing device")
 
@@ -322,11 +341,15 @@ def build_jobs(
     username: str,
     password: str,
     snmp_community: Optional[str],
+    device_type: Optional[str] = None,
+    skip_ping: bool = False,
+    log_dir: Optional[Path] = None,
 ) -> List[DeviceJob]:
+    """``device_type`` skips autodetection; ``skip_ping`` skips reachability checks."""
+    log_dir = log_dir or Path.cwd()
     jobs: List[DeviceJob] = []
     for host in hosts:
-        reachable = ping_check(host)
-        if not reachable:
+        if not skip_ping and not ping_check(host):
             jobs.append(
                 DeviceJob(
                     host=host,
@@ -335,11 +358,14 @@ def build_jobs(
                     commands=list(commands),
                     reachable=False,
                     error="Host unreachable",
+                    log_dir=log_dir,
                 )
             )
             continue
 
-        device_type = detect_device_type(host, username, password, snmp_community)
+        dtype = device_type or detect_device_type(
+            host, username, password, snmp_community
+        )
         jobs.append(
             DeviceJob(
                 host=host,
@@ -347,8 +373,9 @@ def build_jobs(
                 password=password,
                 commands=list(commands),
                 reachable=True,
-                device_type=device_type,
-                error=None if device_type else "Unable to determine device type",
+                device_type=dtype,
+                error=None if dtype else "Unable to determine device type",
+                log_dir=log_dir,
             )
         )
     return jobs
@@ -390,6 +417,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a list of commands across a list of network devices."
     )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
+    )
     parser.add_argument("--user", help="SSH username (prompted if omitted)")
     parser.add_argument(
         "--devices-file", type=Path, help="Path to devices list (prompted if omitted)"
@@ -404,9 +434,30 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "(or set SNMP_COMMUNITY env var)",
     )
     parser.add_argument(
+        "--device-type",
+        help="Netmiko device type for every host (e.g. cisco_ios); "
+        "skips SNMP/SSH autodetection entirely",
+    )
+    parser.add_argument(
         "--config",
         action="store_true",
         help="Run commands in config mode (otherwise only show-style commands allowed)",
+    )
+    parser.add_argument(
+        "--no-ping",
+        action="store_true",
+        help="Skip the ICMP reachability check before connecting",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the execution plan and exit without connecting to anything",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path.cwd(),
+        help="Directory for per-device logs and the session summary (default: cwd)",
     )
     parser.add_argument(
         "--yes",
@@ -416,8 +467,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--session-log",
         type=Path,
-        default=DEFAULT_SESSION_LOG,
-        help="Where to write the JSON session summary",
+        help="Where to write the JSON session summary "
+        "(default: <output-dir>/session_<timestamp>.json)",
     )
     parser.add_argument(
         "--concurrency",
@@ -446,11 +497,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     configure_root_logging(args.verbose)
 
-    username = args.user or input("User: ")
-    password = getpass("Password: ")
-
-    devices_path = _prompt_path("Devices File", args.devices_file)
-    commands_path = _prompt_path("Commands File", args.commands_file)
+    # Validate all inputs before prompting for credentials so a typo'd path
+    # or a disallowed command never costs the user a password prompt.
+    try:
+        devices_path = _prompt_path("Devices File", args.devices_file)
+        commands_path = _prompt_path("Commands File", args.commands_file)
+    except FileNotFoundError as exc:
+        logger.error("%s", exc)
+        return 1
 
     hosts = parse_devices_file(devices_path)
     commands = parse_commands_file(commands_path)
@@ -462,19 +516,49 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         logger.error("No commands to run")
         return 1
 
+    if not args.config:
+        disallowed = [c for c in commands if not _is_show_command(c)]
+        if disallowed:
+            logger.error(
+                "Non-show command(s) not allowed without --config: %s",
+                ", ".join(repr(c) for c in disallowed),
+            )
+            return 1
+
+    mode = "config" if args.config else "read-only"
     cmd_list = "\n        - ".join([""] + commands)
     print(
         f"\n{SEP_MAJOR}\nTotal devices: {len(hosts)}"
+        f"\nMode: {mode}\nConcurrency: {args.concurrency}"
         f"\nCommand(s):{cmd_list}\n{SEP_MAJOR}\n"
     )
+    if args.dry_run:
+        print("Dry run - nothing executed.")
+        return 0
     if not args.yes and not confirm("Proceed? [y/n]: "):
         print("Exiting.. ")
         return 0
 
+    username = args.user or input("User: ")
+    password = os.environ.get("SSHFLEET_PASSWORD") or getpass("Password: ")
+
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    session_log = args.session_log or output_dir / f"session_{SESSION_TIMESTAMP}.json"
+
     print("=" * 75)
     start = datetime.now()
 
-    jobs = build_jobs(hosts, commands, username, password, args.snmp_community)
+    jobs = build_jobs(
+        hosts,
+        commands,
+        username,
+        password,
+        args.snmp_community,
+        device_type=args.device_type,
+        skip_ping=args.no_ping,
+        log_dir=output_dir,
+    )
     results = run_jobs(jobs, config_mode=args.config, concurrency=args.concurrency)
 
     end = datetime.now()
@@ -489,9 +573,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"\nErrors: {json.dumps([r.to_dict() for r in failed], indent=4)}"
     )
 
-    args.session_log.write_text(
-        json.dumps([r.to_dict() for r in results], indent=2)
-    )
+    session_log.write_text(json.dumps([r.to_dict() for r in results], indent=2))
     return 0 if not failed else 2
 
 
