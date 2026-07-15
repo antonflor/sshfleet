@@ -1,4 +1,4 @@
-"""Test setup: load the script as a module without requiring real netmiko."""
+"""Test setup: load sshfleet.py as a module without requiring real netmiko."""
 
 from __future__ import annotations
 
@@ -41,11 +41,9 @@ def _install_netmiko_stub() -> None:
 
 @pytest.fixture(scope="session")
 def nda():
-    """Import NetworkDeviceAutomation.py as the module ``nda``."""
+    """Import sshfleet.py as the module ``nda`` (historic fixture name)."""
     _install_netmiko_stub()
-    spec = importlib.util.spec_from_file_location(
-        "nda", REPO_ROOT / "NetworkDeviceAutomation.py"
-    )
+    spec = importlib.util.spec_from_file_location("nda", REPO_ROOT / "sshfleet.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules["nda"] = module  # required for dataclass introspection
     assert spec.loader is not None

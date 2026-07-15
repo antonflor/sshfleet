@@ -1,3 +1,4 @@
+# Convenience mirror of `pip install -e .[dev]` (pyproject.toml is canonical)
 -r requirements.txt
 pytest>=7
 ruff>=0.4
