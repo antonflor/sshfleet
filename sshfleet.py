@@ -22,12 +22,13 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict
+from functools import lru_cache
 from datetime import datetime
 from getpass import getpass
 from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Sequence
 
-from netmiko import ConnectHandler, SSHDetect, SNMPDetect
+from netmiko import ConnectHandler, SSHDetect
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 __version__ = "2.0.0"
@@ -142,6 +143,21 @@ def ping_check(host: str, count: int = 3, timeout: int = 2) -> bool:
 # --------------------------------------------------------------------------- #
 
 
+@lru_cache(maxsize=None)
+def _snmp_detect_cls():
+    """SNMPDetect is optional: it moved out of netmiko's top level and needs pysnmp."""
+    try:
+        from netmiko.snmp_autodetect import SNMPDetect
+
+        return SNMPDetect
+    except ImportError:
+        logger.warning(
+            "SNMP detection unavailable (install the 'pysnmp' extra: "
+            "pip install sshfleet[snmp]); falling back to SSH autodetect"
+        )
+        return None
+
+
 def detect_device_type(
     host: str,
     username: str,
@@ -154,9 +170,10 @@ def detect_device_type(
     last_error: Optional[str] = None
 
     for attempt in range(1, attempts + 1):
-        if snmp_community:
+        snmp_detect = _snmp_detect_cls() if snmp_community else None
+        if snmp_detect is not None:
             try:
-                guess = SNMPDetect(
+                guess = snmp_detect(
                     hostname=host,
                     community=snmp_community,
                     snmp_version="v2c",

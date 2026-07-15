@@ -23,8 +23,12 @@ def _install_netmiko_stub() -> None:
 
     netmiko.ConnectHandler = _Stub
     netmiko.SSHDetect = _Stub
-    netmiko.SNMPDetect = _Stub
     sys.modules["netmiko"] = netmiko
+
+    # SNMPDetect is lazily imported from netmiko.snmp_autodetect (needs pysnmp)
+    snmp_autodetect = types.ModuleType("netmiko.snmp_autodetect")
+    snmp_autodetect.SNMPDetect = _Stub
+    sys.modules["netmiko.snmp_autodetect"] = snmp_autodetect
 
     exceptions = types.ModuleType("netmiko.exceptions")
 

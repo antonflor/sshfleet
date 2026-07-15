@@ -6,6 +6,16 @@ from __future__ import annotations
 import pytest
 
 
+def test_snmp_detect_cls_none_when_pysnmp_missing(nda, monkeypatch):
+    import sys
+
+    nda._snmp_detect_cls.cache_clear()
+    # a None entry in sys.modules makes the lazy import raise ImportError
+    monkeypatch.setitem(sys.modules, "netmiko.snmp_autodetect", None)
+    assert nda._snmp_detect_cls() is None
+    nda._snmp_detect_cls.cache_clear()
+
+
 def test_parse_args_new_defaults(nda):
     ns = nda.parse_args([])
     assert ns.device_type is None

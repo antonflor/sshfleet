@@ -118,8 +118,10 @@ SSHFLEET_PASSWORD="$(vault kv get -field=pw net/creds)" \
 ### SNMP-based device-type autodetect
 
 If you supply an SNMP community, detection tries SNMP first (faster than SSH
-autodetect) before falling back to SSH. Never hardcode the community in
-source — pass it explicitly:
+autodetect) before falling back to SSH. SNMP support needs the optional
+`pysnmp` dependency — install with `pip install sshfleet[snmp]` (or
+`pipx install "sshfleet[snmp] @ git+https://github.com/antonflor/sshfleet.git"`).
+Never hardcode the community in source — pass it explicitly:
 
 ```bash
 sshfleet --snmp-community public ...
