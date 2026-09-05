@@ -180,6 +180,8 @@ sshfleet is deliberately small: run a list of commands across an inventory of
 It is not a general server-configuration tool; for Linux fleet management,
 key distribution, and orchestration, reach for Ansible/Fabric/pssh.
 
+Current status, what's verified, and what's next: [docs/STATUS.md](docs/STATUS.md).
+
 ## Development
 
 ```bash
